@@ -10,6 +10,7 @@ import numpy as np
 import openvino as ov
 
 from decoder import OpenPoseDecoder
+from ae_decoder import AssociativeEmbeddingDecoder
 from numpy.lib.stride_tricks import as_strided
 
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils")
@@ -360,7 +361,7 @@ class HalloweenTheme(Theme):
         self.device = device
         self.point_score_threshold = 0.25
 
-        self.decoder = OpenPoseDecoder()
+        self.decoder = AssociativeEmbeddingDecoder()
         self.pose_estimation_model = None
 
         self.tracked_poses = {}
@@ -371,20 +372,22 @@ class HalloweenTheme(Theme):
         self.load_models(device)
 
     def load_models(self, device: str):
-        self.pose_estimation_model = self._load_model("human-pose-estimation-0001", self.model_precision, device)
+        self.pose_estimation_model = self._load_model("human-pose-estimation-0005", self.model_precision, device)
 
     def run_inference(self, frame: np.ndarray) -> Any:
-        pe_input, pe_output_pafs, pe_output_heatmaps = self.pose_estimation_model.input(0), self.pose_estimation_model.output("Mconv7_stage2_L1"), self.pose_estimation_model.output("Mconv7_stage2_L2")
+        pe_input = self.pose_estimation_model.input(0)
+        pe_output_heatmaps = self.pose_estimation_model.output("heatmaps")
+        pe_output_embeddings = self.pose_estimation_model.output("embeddings")
         height, width = list(pe_input.shape)[2:4]
 
         input_img = self.__preprocess_image(frame, width, height)
 
         results = self.pose_estimation_model([input_img])
-        pafs = results[pe_output_pafs]
         heatmaps = results[pe_output_heatmaps]
+        embeddings = results[pe_output_embeddings]
 
         # Get poses from network results.
-        poses, scores = self.__process_results(frame, pafs, heatmaps)
+        poses, scores = self.__process_results(frame, heatmaps, embeddings)
         poses, scores = self._smooth_detections(poses, scores)
         # add additional points to skeletons
         poses = [self.__add_artificial_points(pose, self.point_score_threshold) for pose in poses]
@@ -558,43 +561,10 @@ class HalloweenTheme(Theme):
         input_img = input_img.transpose((2, 0, 1))[np.newaxis, ...]
         return input_img
 
-    def __process_results(self, img, pafs, heatmaps):
-        def heatmap_nms(heatmaps, pooled_heatmaps):
-            return heatmaps * (heatmaps == pooled_heatmaps)
-
-        # 2D pooling in numpy (from: https://stackoverflow.com/a/54966908/1624463)
-        def pool2d(A, kernel_size, stride, padding, pool_mode="max"):
-            # Padding
-            A = np.pad(A, padding, mode="constant")
-
-            # Window view of A
-            output_shape = (
-                (A.shape[0] - kernel_size) // stride + 1,
-                (A.shape[1] - kernel_size) // stride + 1,
-            )
-            kernel_size = (kernel_size, kernel_size)
-            A_w = as_strided(
-                A,
-                shape=output_shape + kernel_size,
-                strides=(stride * A.strides[0], stride * A.strides[1]) + A.strides
-            )
-            A_w = A_w.reshape(-1, *kernel_size)
-
-            # Return the result of pooling.
-            if pool_mode == "max":
-                return A_w.max(axis=(1, 2)).reshape(output_shape)
-            elif pool_mode == "avg":
-                return A_w.mean(axis=(1, 2)).reshape(output_shape)
-
-        # This processing comes from
-        # https://github.com/openvinotoolkit/open_model_zoo/blob/master/demos/common/python/models/open_pose.py
-        pooled_heatmaps = np.array(
-            [[pool2d(h, kernel_size=3, stride=1, padding=1, pool_mode="max") for h in heatmaps[0]]]
-        )
-        nms_heatmaps = heatmap_nms(heatmaps, pooled_heatmaps)
-
-        # Decode poses.
-        poses, scores = self.decoder(heatmaps, nms_heatmaps, pafs)
+    def __process_results(self, img, heatmaps, embeddings):
+        # Decode poses using associative embedding decoder.
+        # NMS is pre-applied in the new model, so no need for manual NMS processing.
+        poses, scores = self.decoder(heatmaps, embeddings)
         output_shape = list(self.pose_estimation_model.output(index=0).partial_shape)
         output_scale = img.shape[1] / output_shape[3].get_length(), img.shape[0] / output_shape[2].get_length()
         # Multiply coordinates by a scaling factor.
