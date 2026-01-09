@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import openvino as ov
 
-from decoder import OpenPoseDecoder
+from decoder import AssociativeEmbeddingDecoder
 from numpy.lib.stride_tricks import as_strided
 
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "utils")
@@ -360,7 +360,7 @@ class HalloweenTheme(Theme):
         self.device = device
         self.point_score_threshold = 0.25
 
-        self.decoder = OpenPoseDecoder()
+        self.decoder = AssociativeEmbeddingDecoder()
         self.pose_estimation_model = None
 
         self.tracked_poses = {}
@@ -559,42 +559,9 @@ class HalloweenTheme(Theme):
         return input_img
 
     def __process_results(self, img, embeddings, heatmaps):
-        def heatmap_nms(heatmaps, pooled_heatmaps):
-            return heatmaps * (heatmaps == pooled_heatmaps)
-
-        # 2D pooling in numpy (from: https://stackoverflow.com/a/54966908/1624463)
-        def pool2d(A, kernel_size, stride, padding, pool_mode="max"):
-            # Padding
-            A = np.pad(A, padding, mode="constant")
-
-            # Window view of A
-            output_shape = (
-                (A.shape[0] - kernel_size) // stride + 1,
-                (A.shape[1] - kernel_size) // stride + 1,
-            )
-            kernel_size = (kernel_size, kernel_size)
-            A_w = as_strided(
-                A,
-                shape=output_shape + kernel_size,
-                strides=(stride * A.strides[0], stride * A.strides[1]) + A.strides
-            )
-            A_w = A_w.reshape(-1, *kernel_size)
-
-            # Return the result of pooling.
-            if pool_mode == "max":
-                return A_w.max(axis=(1, 2)).reshape(output_shape)
-            elif pool_mode == "avg":
-                return A_w.mean(axis=(1, 2)).reshape(output_shape)
-
-        # This processing comes from
-        # https://github.com/openvinotoolkit/open_model_zoo/blob/master/demos/common/python/models/open_pose.py
-        pooled_heatmaps = np.array(
-            [[pool2d(h, kernel_size=3, stride=1, padding=1, pool_mode="max") for h in heatmaps[0]]]
-        )
-        nms_heatmaps = heatmap_nms(heatmaps, pooled_heatmaps)
-
-        # Decode poses.
-        poses, scores = self.decoder(heatmaps, nms_heatmaps, embeddings)
+        # Decode poses using associative embedding decoder.
+        # NMS is pre-applied in the model (negative values indicate suppressed locations).
+        poses, scores = self.decoder(heatmaps, embeddings)
         output_shape = list(self.pose_estimation_model.output(index=0).partial_shape)
         output_scale = img.shape[1] / output_shape[3].get_length(), img.shape[0] / output_shape[2].get_length()
         # Multiply coordinates by a scaling factor.
